@@ -666,6 +666,48 @@ impl Link {
         }
     }
 
+    /// Resolves this link's [merge](Link::merge) semantics against the body of
+    /// the original request.
+    ///
+    /// Per the STAC API pagination spec, if `merge` is `true` the link's `body`
+    /// must be merged into the body of the original request. If `merge` is
+    /// absent or `false` (the default) the link's `body` is used as-is. Fields
+    /// in the link's `body` take precedence over the original request's.
+    ///
+    /// This is what makes paging work for servers that return a partial `next`
+    /// body, e.g. a bare offset or page number, and expect the client to retain
+    /// the original query. Returns the link with its `body` resolved and `merge`
+    /// cleared, ready to be requested.
+    ///
+    /// See the [STAC API pagination
+    /// examples](https://github.com/radiantearth/stac-api-spec/blob/release/v1.0.0/item-search/examples.md).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use stac::Link;
+    /// use serde_json::{json, Map};
+    ///
+    /// let mut original_body = Map::new();
+    /// let _ = original_body.insert("collections".into(), json!(["a-collection"]));
+    ///
+    /// let mut link = Link::new("href", "next").body(json!({"_o": 100})).unwrap();
+    /// link.merge = Some(true);
+    ///
+    /// let body = link.resolve_merge(Some(&original_body)).body.unwrap();
+    /// assert_eq!(body["collections"], json!(["a-collection"]));
+    /// assert_eq!(body["_o"], json!(100));
+    /// ```
+    pub fn resolve_merge(mut self, original_body: Option<&Map<String, Value>>) -> Link {
+        if self.merge.unwrap_or_default() {
+            let mut body = original_body.cloned().unwrap_or_default();
+            body.extend(self.body.take().into_iter().flatten());
+            self.body = Some(body);
+            self.merge = None;
+        }
+        self
+    }
+
     /// Makes this link absolute.
     ///
     /// If the href is relative, use the passed in value as a base.
@@ -709,6 +751,60 @@ mod tests {
         let value = serde_json::to_value(link).unwrap();
         assert!(value.get("type").is_none());
         assert!(value.get("title").is_none());
+    }
+
+    mod resolve_merge {
+        use crate::Link;
+        use serde_json::{Map, Value, json};
+
+        fn original_body() -> Map<String, Value> {
+            let mut body = Map::new();
+            let _ = body.insert("collections".into(), json!(["a-collection"]));
+            let _ = body.insert("limit".into(), json!(1000));
+            body
+        }
+
+        #[test]
+        fn merges_into_original_body() {
+            let mut link = Link::new("href", "next").body(json!({"_o": 1000})).unwrap();
+            link.merge = Some(true);
+            let link = link.resolve_merge(Some(&original_body()));
+            let body = link.body.unwrap();
+            assert_eq!(body["collections"], json!(["a-collection"]));
+            assert_eq!(body["limit"], json!(1000));
+            assert_eq!(body["_o"], json!(1000));
+            assert!(link.merge.is_none());
+        }
+
+        #[test]
+        fn link_body_takes_precedence() {
+            let mut link = Link::new("href", "next")
+                .body(json!({"limit": 10}))
+                .unwrap();
+            link.merge = Some(true);
+            let body = link.resolve_merge(Some(&original_body())).body.unwrap();
+            assert_eq!(body["limit"], json!(10));
+        }
+
+        #[test]
+        fn without_merge_body_is_unchanged() {
+            // A self-contained next body (e.g. pgstac's token) must replace, not merge.
+            let link = Link::new("href", "next")
+                .body(json!({"token": "next:abc", "limit": 10}))
+                .unwrap();
+            let body = link.resolve_merge(Some(&original_body())).body.unwrap();
+            assert_eq!(body["token"], json!("next:abc"));
+            assert_eq!(body["limit"], json!(10));
+            assert!(body.get("collections").is_none());
+        }
+
+        #[test]
+        fn merge_without_original_body() {
+            let mut link = Link::new("href", "next").body(json!({"_o": 10})).unwrap();
+            link.merge = Some(true);
+            let body = link.resolve_merge(None).body.unwrap();
+            assert_eq!(body, json!({"_o": 10}).as_object().unwrap().clone());
+        }
     }
 
     mod links {

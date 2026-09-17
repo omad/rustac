@@ -254,7 +254,9 @@ impl Client {
         let page = self
             .request(Method::GET, url.clone(), items.as_ref(), None)
             .await?;
-        Ok(stream_items(self.clone(), page, self.channel_buffer))
+        // `next` links for GET requests carry their parameters in the href, so
+        // there's no original request body to merge into them.
+        Ok(stream_items(self.clone(), page, None, self.channel_buffer))
     }
 
     /// Searches an API, returning a stream of items.
@@ -315,6 +317,10 @@ impl Client {
         response.json().await.map_err(Error::from)
     }
 
+    /// Requests a link.
+    ///
+    /// Any [merge](Link::merge) semantics are expected to have already been
+    /// resolved by [Link::resolve_merge].
     async fn request_from_link<R>(&self, link: Link) -> Result<R>
     where
         R: DeserializeOwned,
@@ -334,8 +340,13 @@ impl Client {
         } else {
             None
         };
-        self.request::<Map<String, Value>, R>(method, link.href.as_str(), &link.body, headers)
-            .await
+        self.request::<Map<String, Value>, R>(
+            method,
+            link.href.as_str(),
+            link.body.as_ref(),
+            headers,
+        )
+        .await
     }
 }
 
@@ -344,7 +355,7 @@ impl ItemsClient for Client {
 
     async fn search(&self, search: Search) -> std::result::Result<ItemCollection, Error> {
         let url = self.url_builder.search().clone();
-        tracing::debug!("searching {url}");
+        tracing::debug!("searching {url} for {search:?}");
         self.post(url, &search).await
     }
 }
@@ -357,8 +368,7 @@ impl StreamItemsClient for Client {
         search: Search,
     ) -> std::result::Result<impl Stream<Item = std::result::Result<Item, Error>> + Send, Error>
     {
-        let page = ItemsClient::search(self, search).await?;
-        Ok(stream_items(self.clone(), page, self.channel_buffer))
+        search_and_stream_items(self.clone(), search).await
     }
 
     async fn items_stream(
@@ -407,11 +417,7 @@ impl BlockingClient {
     /// ```
     pub fn search(&self, search: Search) -> Result<BlockingIterator> {
         let runtime = Builder::new_current_thread().enable_all().build()?;
-        let client = self.0.clone();
-        let stream = runtime.block_on(async move {
-            let page = ItemsClient::search(&client, search).await?;
-            Ok::<_, Error>(stream_items(client, page, self.0.channel_buffer))
-        })?;
+        let stream = runtime.block_on(search_and_stream_items(self.0.clone(), search))?;
         Ok(BlockingIterator {
             runtime,
             stream: Box::pin(stream),
@@ -430,11 +436,12 @@ impl Iterator for BlockingIterator {
 fn stream_items(
     client: Client,
     page: ItemCollection,
+    original_body: Option<Map<String, Value>>,
     channel_buffer: usize,
 ) -> impl Stream<Item = Result<Item>> {
     let (tx, mut rx) = mpsc::channel(channel_buffer);
     let handle: JoinHandle<std::result::Result<(), SendError<_>>> = tokio::spawn(async move {
-        let pages = stream_pages(client, page);
+        let pages = stream_pages(client, page, original_body);
         pin_mut!(pages);
         while let Some(result) = pages.next().await {
             match result {
@@ -458,16 +465,54 @@ fn stream_items(
     }
 }
 
+/// Searches an API, then streams items across all pages.
+///
+/// The search parameters are retained as the original request body so that
+/// `next` links using `"merge": true` can be resolved against them. Takes an
+/// owned client so the returned stream is independent of any borrow.
+async fn search_and_stream_items(
+    client: Client,
+    search: Search,
+) -> Result<impl Stream<Item = Result<Item>> + Send> {
+    let original_body = request_body(&search)?;
+    let channel_buffer = client.channel_buffer;
+    let page = ItemsClient::search(&client, search).await?;
+    Ok(stream_items(client, page, original_body, channel_buffer))
+}
+
+/// Serializes request parameters into a request body.
+///
+/// The body is kept as a JSON object so that a `next` link's partial body can
+/// be merged into it, see [Link::resolve_merge].
+fn request_body<S>(params: &S) -> Result<Option<Map<String, Value>>>
+where
+    S: Serialize,
+{
+    match serde_json::to_value(params)? {
+        Value::Object(body) => Ok(Some(body)),
+        Value::Null => Ok(None),
+        value => Err(stac::Error::IncorrectType {
+            actual: value.to_string(),
+            expected: "object".to_string(),
+        }
+        .into()),
+    }
+}
+
 fn stream_pages(
     client: Client,
     mut page: ItemCollection,
+    original_body: Option<Map<String, Value>>,
 ) -> impl Stream<Item = Result<ItemCollection>> {
     try_stream! {
         loop {
             if page.items.is_empty() {
                 break;
             }
-            let next_link = page.link("next").cloned();
+            let next_link = page
+                .link("next")
+                .cloned()
+                .map(|link| link.resolve_merge(original_body.as_ref()));
             yield page;
             if let Some(next_link) = next_link {
                 if let Some(next_page) = client.request_from_link(next_link).await? {
@@ -553,6 +598,68 @@ mod tests {
                 "collections": ["sentinel-2-l2a"],
                 "limit": 1,
                 "token": "next:S2A_MSIL2A_20230216T150721_R082_T19PHS_20230217T082924"
+            })))
+            .with_body(include_str!("../mocks/search-page-2.json"))
+            .with_header("content-type", "application/geo+json")
+            .create_async()
+            .await;
+
+        let client = Client::new(&server.url()).unwrap();
+        let mut search = Search {
+            collections: vec!["sentinel-2-l2a".to_string()],
+            ..Default::default()
+        };
+        search.items.limit = Some(1);
+        let items: Vec<_> = StreamItemsClient::search_stream(&client, search)
+            .await
+            .unwrap()
+            .map(|result| result.unwrap())
+            .take(2)
+            .collect()
+            .await;
+        page_1.assert_async().await;
+        page_2.assert_async().await;
+        assert_eq!(items.len(), 2);
+        assert!(items[0]["id"] != items[1]["id"]);
+    }
+
+    #[tokio::test]
+    async fn search_with_paging_merge() {
+        // Regression test for `"merge": true` next links (e.g. ODC Explorer).
+        //
+        // The next link carries only a partial body (`{"_o": 1}`) and sets
+        // `merge: true`, so the client must merge it into the *original* request
+        // body (which held `collections` + `limit`). Previously rustac dropped
+        // the original body and sent only `{"_o": 1}`, losing the collection
+        // filter and paging through the entire catalog.
+        //
+        // <https://github.com/radiantearth/stac-api-spec/blob/release/v1.0.0/item-search/examples.md>
+        let mut server = Server::new_async().await;
+        let mut page_1_body: ItemCollection =
+            serde_json::from_str(include_str!("../mocks/search-page-1.json")).unwrap();
+        let mut next_link = page_1_body.link("next").unwrap().clone();
+        next_link.href = format!("{}/search", server.url());
+        next_link.merge = Some(true);
+        next_link.body = Some(serde_json::from_value(json!({ "_o": 1 })).unwrap());
+        page_1_body.set_link(next_link);
+        let page_1 = server
+            .mock("POST", "/search")
+            .match_body(Matcher::Json(json!({
+                "collections": ["sentinel-2-l2a"],
+                "limit": 1
+            })))
+            .with_body(serde_json::to_string(&page_1_body).unwrap())
+            .with_header("content-type", "application/geo+json")
+            .create_async()
+            .await;
+        // Page 2 must receive the *merged* body: original collections + limit,
+        // with `_o` merged in from the next link.
+        let page_2 = server
+            .mock("POST", "/search")
+            .match_body(Matcher::Json(json!({
+                "collections": ["sentinel-2-l2a"],
+                "limit": 1,
+                "_o": 1
             })))
             .with_body(include_str!("../mocks/search-page-2.json"))
             .with_header("content-type", "application/geo+json")
