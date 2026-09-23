@@ -167,6 +167,7 @@ impl Client {
         Ok(stream::<Collections>(
             self.clone(),
             page,
+            Paging::Get,
             self.channel_buffer,
         ))
     }
@@ -216,6 +217,7 @@ impl Client {
         Ok(stream::<ItemCollection>(
             self.clone(),
             page,
+            Paging::Get,
             self.channel_buffer,
         ))
     }
@@ -320,8 +322,9 @@ impl StreamItemsClient for Client {
         search: Search,
     ) -> std::result::Result<impl Stream<Item = std::result::Result<Item, Error>> + Send, Error>
     {
+        let paging = Paging::post(&search)?;
         let page = ItemsClient::search(self, search).await?;
-        Ok(stream(self.clone(), page, self.channel_buffer))
+        Ok(stream(self.clone(), page, paging, self.channel_buffer))
     }
 
     async fn items_stream(
@@ -372,8 +375,9 @@ impl BlockingClient {
         let runtime = Builder::new_current_thread().enable_all().build()?;
         let client = self.0.clone();
         let stream = runtime.block_on(async move {
+            let paging = Paging::post(&search)?;
             let page = ItemsClient::search(&client, search).await?;
-            Ok::<_, Error>(stream(client, page, self.0.channel_buffer))
+            Ok::<_, Error>(stream(client, page, paging, self.0.channel_buffer))
         })?;
         Ok(BlockingIterator {
             runtime,
@@ -416,14 +420,72 @@ impl Streamable for ItemCollection {
     }
 }
 
+/// How to resolve `next` links while paginating.
+///
+/// The STAC API pagination `merge` field only has meaning for POST pagination,
+/// where the `next` link can carry a partial body that must be combined with the
+/// body of the original request. A GET `next` link carries all of its parameters
+/// in its href, so there is nothing to merge into.
+///
+/// See the [STAC API pagination
+/// examples](https://github.com/radiantearth/stac-api-spec/blob/release/v1.0.0/item-search/examples.md).
+#[derive(Clone, Debug)]
+enum Paging {
+    /// Pagination for a GET request, which cannot use `merge`.
+    Get,
+
+    /// Pagination for a POST request, holding the body of the original request
+    /// so a `next` link asking to `merge` can be resolved against it.
+    Post(Map<String, Value>),
+}
+
+impl Paging {
+    /// Creates POST paging from the parameters of the original request.
+    fn post<S: Serialize>(params: &S) -> Result<Paging> {
+        match serde_json::to_value(params)? {
+            Value::Object(body) => Ok(Paging::Post(body)),
+            value => Err(stac::Error::IncorrectType {
+                actual: value.to_string(),
+                expected: "object".to_string(),
+            }
+            .into()),
+        }
+    }
+
+    /// Resolves a `next` link's `merge` field, returning a link ready to request.
+    ///
+    /// If this is POST paging and the POST `next` link asks to merge, the link's
+    /// body is merged into the original request's body, with the link's own
+    /// fields taking precedence. Without this, a server that returns a partial
+    /// `next` body, e.g. a bare offset, would lose the original query, and paging
+    /// would walk the entire catalog instead of the requested subset.
+    ///
+    /// Any other link is returned unchanged.
+    fn resolve(&self, mut link: Link) -> Link {
+        if let Paging::Post(original_body) = self
+            && link.merge.unwrap_or_default()
+            && link
+                .method
+                .as_deref()
+                .is_some_and(|method| method.eq_ignore_ascii_case("POST"))
+        {
+            let mut body = original_body.clone();
+            body.extend(link.body.take().into_iter().flatten());
+            link.body = Some(body);
+        }
+        link
+    }
+}
+
 fn stream<Page: Streamable + 'static>(
     client: Client,
     page: Page,
+    paging: Paging,
     channel_buffer: usize,
 ) -> impl Stream<Item = Result<Page::Item>> {
     let (tx, mut rx) = mpsc::channel(channel_buffer);
     let handle: JoinHandle<std::result::Result<(), SendError<_>>> = tokio::spawn(async move {
-        let pages = stream_pages(client, page);
+        let pages = stream_pages(client, page, paging);
         pin_mut!(pages);
         while let Some(result) = pages.next().await {
             match result {
@@ -450,13 +512,14 @@ fn stream<Page: Streamable + 'static>(
 fn stream_pages<Page: Streamable>(
     client: Client,
     mut page: Page,
+    paging: Paging,
 ) -> impl Stream<Item = Result<Page>> {
     try_stream! {
         loop {
             if page.is_empty() {
                 break;
             }
-            let next_link = page.link("next").cloned();
+            let next_link = page.link("next").cloned().map(|link| paging.resolve(link));
             yield page;
             if let Some(next_link) = next_link {
                 if let Some(next_page) = client.request_from_link(next_link).await? {
@@ -566,6 +629,109 @@ mod tests {
         page_2.assert_async().await;
         assert_eq!(items.len(), 2);
         assert!(items[0]["id"] != items[1]["id"]);
+    }
+
+    #[tokio::test]
+    async fn search_with_paging_merge() {
+        // The STAC API allows servers responding to POST requests to set
+        // `"merge": true` on `next` links. This tells the client to merge the
+        // returned Link with the original request.
+        let mut server = Server::new_async().await;
+        let mut page_1_body: ItemCollection =
+            serde_json::from_str(include_str!("../mocks/search-page-1.json")).unwrap();
+        let mut next_link = page_1_body.link("next").unwrap().clone();
+        next_link.href = format!("{}/search", server.url());
+        next_link.merge = Some(true);
+        next_link.body = Some(json!({"page": 2}).as_object().unwrap().clone());
+        page_1_body.set_link(next_link);
+        let page_1 = server
+            .mock("POST", "/search")
+            .match_body(Matcher::Json(json!({
+                "collections": ["sentinel-2-l2a"],
+                "limit": 1
+            })))
+            .with_body(serde_json::to_string(&page_1_body).unwrap())
+            .with_header("content-type", "application/geo+json")
+            .create_async()
+            .await;
+        // The second page must be requested with the original collections and
+        // limit, plus the offset merged in from the `next` link.
+        let page_2 = server
+            .mock("POST", "/search")
+            .match_body(Matcher::Json(json!({
+                "collections": ["sentinel-2-l2a"],
+                "limit": 1,
+                "page": 2
+            })))
+            .with_body(include_str!("../mocks/search-page-2.json"))
+            .with_header("content-type", "application/geo+json")
+            .create_async()
+            .await;
+
+        let client = Client::new(&server.url()).unwrap();
+        let mut search = Search {
+            collections: vec!["sentinel-2-l2a".to_string()],
+            ..Default::default()
+        };
+        search.items.limit = Some(1);
+        let items: Vec<_> = StreamItemsClient::search_stream(&client, search)
+            .await
+            .unwrap()
+            .map(|result| result.unwrap())
+            .take(2)
+            .collect()
+            .await;
+        page_1.assert_async().await;
+        page_2.assert_async().await;
+        assert_eq!(items.len(), 2);
+        assert!(items[0]["id"] != items[1]["id"]);
+    }
+
+    #[tokio::test]
+    async fn merge_is_ignored_for_a_get_next_link() {
+        // `merge` is only defined for POST pagination, not for GET `next` links.
+        let mut server = Server::new_async().await;
+        let mut page_1_body: ItemCollection =
+            serde_json::from_str(include_str!("../mocks/search-page-1.json")).unwrap();
+        let mut next_link = page_1_body.link("next").unwrap().clone();
+        next_link.href = format!("{}/search", server.url());
+        next_link.method = Some("GET".to_string());
+        next_link.merge = Some(true);
+        next_link.body = Some(json!({"_o": 1}).as_object().unwrap().clone());
+        page_1_body.set_link(next_link);
+        let page_1 = server
+            .mock("POST", "/search")
+            .match_body(Matcher::Json(json!({
+                "collections": ["sentinel-2-l2a"],
+                "limit": 1
+            })))
+            .with_body(serde_json::to_string(&page_1_body).unwrap())
+            .with_header("content-type", "application/geo+json")
+            .create_async()
+            .await;
+        let page_2 = server
+            .mock("GET", "/search?_o=1")
+            .with_body(include_str!("../mocks/search-page-2.json"))
+            .with_header("content-type", "application/geo+json")
+            .create_async()
+            .await;
+
+        let client = Client::new(&server.url()).unwrap();
+        let mut search = Search {
+            collections: vec!["sentinel-2-l2a".to_string()],
+            ..Default::default()
+        };
+        search.items.limit = Some(1);
+        let items: Vec<_> = StreamItemsClient::search_stream(&client, search)
+            .await
+            .unwrap()
+            .map(|result| result.unwrap())
+            .take(2)
+            .collect()
+            .await;
+        page_1.assert_async().await;
+        page_2.assert_async().await;
+        assert_eq!(items.len(), 2);
     }
 
     #[tokio::test]
